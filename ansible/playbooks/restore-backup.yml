@@ -1,0 +1,138 @@
+---
+# This playbook can only be run on staging. Because it needs access to the
+# production AWS bucket, you need to add "--vault-id production@prompt" to the
+# run-playbook.sh call!
+- hosts: "staging"
+  user: "ansible"
+  become: true
+  become_user: "root"
+  become_method: "sudo"
+  force_handlers: true
+
+  vars_prompt:
+    - name: "confirm"
+      default: 'ABORT'
+      private: false
+      prompt: |-
+        This playbook will restore a backup of the production server onto the
+        staging server. This will replace the data in many directories. There
+        should be twice the size of this backup available as free disk space,
+        since the archives have to be extracted. Because its primary use is
+        testing the integrity of the back-up, this playbook can only be run on
+        a staging server.
+        Assume you will lose any existing data on this staging server. Are you
+        CERTAIN that you wish to continue? If so, enter "obliteration". Any
+        other value will abort
+
+  tasks:
+    - name: "check that confirmation is given"
+      assert:
+        that:
+          - "confirm == 'obliteration'"
+
+    - name: "load secrets from production, in order to access AWS bucket later"
+      include_vars:
+        name: "production"
+        file: "../group_vars/production/vault.yml"
+
+    - name: "create temporary directory to store backup archives"
+      tempfile:
+          prefix: "backup-restore-test."
+          state: "directory"
+      register: "backup_restore_tmp_dir"
+
+    - name: "install dependencies for aws_s3 module"
+      pip:
+        name:
+          - "boto"
+          - "boto3"
+          - "botocore"
+        state: "latest"
+
+    - name: "find latest backups"
+      aws_s3:
+        aws_access_key: "{{ production.vault_secret_backup_aws.access_key }}"
+        aws_secret_key: "{{ production.vault_secret_backup_aws.secret_key }}"
+        bucket: "sticky-automatic-backups"
+        ignore_nonexistent_bucket: true
+        max_keys: 1
+        mode: "list"
+        prefix: "/{{ item }}-{{ '%Y%m%d' | strftime }}-"
+        region: "{{ aws_region }}"
+      register: "backup_filenames"
+      with_items:
+        - "admins/admins"
+        - "websites/websites"
+        - "websites/databases/databases"
+
+    - debug:
+        var: "backup_filenames"
+
+    - name: "download latest backups"
+      aws_s3:
+        aws_access_key: "{{ production.vault_secret_backup_aws.access_key }}"
+        aws_secret_key: "{{ production.vault_secret_backup_aws.secret_key }}"
+        bucket: "sticky-automatic-backups"
+        dest: "{{ backup_restore_tmp_dir.path }}{{ item.msg }}"
+        ignore_nonexistent_bucket: true
+        # object: "/websites/databases/databases-20180211-012214.sql.gz"
+        object: "{{ item.msg }}"
+        mode: "get"
+        overwrite: false
+        region: "{{ aws_region }}"
+      register: "downloaded_items"
+      with_items: "{{ backup_filenames.results }}"
+      # loop_control?
+
+    # Bit of a hack, but this task validates the checksums by trying to
+    # re-download each file, but only if the checksum is different. That should
+    # not be the case, so we treat that specific error message as success.
+    - name: "validate checksums of downloaded archives"
+      aws_s3:
+        aws_access_key: "{{ production.vault_secret_backup_aws.access_key }}"
+        aws_secret_key: "{{ production.vault_secret_backup_aws.secret_key }}"
+        bucket: "sticky-automatic-backups"
+        dest: "{{ backup_restore_tmp_dir.path }}{{ item.msg }}"
+        ignore_nonexistent_bucket: true
+        # object: "/websites/databases/databases-20180211-012214.sql.gz"
+        object: "{{ item.msg }}"
+        mode: "get"
+        overwrite: false
+        region: "{{ aws_region }}"
+      register: "checksum_download"
+      with_items: "{{ backup_filenames.results }}"
+      failed_when:
+        # TODO: Check if message is in stdout or stderr!
+        "'Local and remote object are identical, ignoring. Use
+        overwrite=always parameter to force.' not in checksum_download.stderr"
+      # loop_control?
+
+    - name: "unpack admins and website backups"
+      unarchive:
+        src: "{{ backup_restore_tmp_dir }}{{ item.msg }}"
+        # The paths in the backup archives are relative to /, so this extracts
+        # them to the right location.
+        dest: "/"
+        remote_src: true
+      with_items: "{{ backup_filenames.results }}"
+      when: "'websites/databases/databases' != item.item"
+      loop_control:
+        label: "{{ item.msg | basename }}"
+
+    - name: "restore databases"
+      shell: "zcat {{ backup_restore_tmp_dir }}{{ item.msg }} | mysql"
+      with_items: "{{ backup_filenames.results }}"
+      when: "item.item == 'websites/databases/databases'"
+      loop_control:
+        label: "{{ item.msg | basename }}"
+
+    - name: "delete backup archives"
+      file:
+        path: "{{ backup_restore_tmp_dir.path }}"
+        state: "absent"
+
+    - debug:
+        msg:
+          "The backup has been restored. Check the target folders, the
+          databases and the operation of the server to determine its
+          integrity."
