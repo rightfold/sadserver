@@ -13,6 +13,7 @@ server {
 	ssl_certificate_key /etc/letsencrypt/live/koala.{{ canonical_hostname }}/privkey.pem;
 
 	# Security headers already enforced in Rails
+	include includes/block-cert-validation-path.conf;
 
 	root /var/www/koala.{{ canonical_hostname }}/public;
 
